@@ -1,12 +1,15 @@
 use std::io::Write;
 
 use clap::Parser;
-use minijinja::{context, Environment};
-use ollama_rs::{generation::completion::request::GenerationRequest, IntoUrlSealed, Ollama};
+use ollama_rs::{IntoUrlSealed, Ollama};
 use serde::Deserialize;
+use shark::Shark;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio_stream::StreamExt;
 use toml;
+
+pub mod shark;
+pub mod tools;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -18,7 +21,7 @@ struct Config {
     addr: String,
     model: String,
     color: String,
-    prompt_template: String,
+    functions: Vec<String>,
 }
 
 #[tokio::main]
@@ -28,19 +31,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let question = args.prompt.join(" ");
-    let prompt = parse_prompt(&question, &config.prompt_template);
 
     let url = config.addr.into_url().unwrap();
     let ollama = Ollama::from_url(url);
-    let mut stream = ollama
-        .generate_stream(GenerationRequest::new(config.model, prompt))
-        .await
-        .unwrap();
+    let shark = Shark::new(ollama, config.model, config.functions);
 
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
-    let color = parse_color(&config.color);
-    stdout.set_color(ColorSpec::new().set_fg(Some(color)))?;
+    let mut color_spec = ColorSpec::new();
 
+    stdout.set_color(color_spec.set_fg(Some(Color::Cyan)))?;
+    let stream = shark.generate_stream(question).await;
+    if let Err(e) = stream {
+        stdout.set_color(color_spec.set_fg(Some(Color::Red)))?;
+        let err =
+            format!("Sorry I can't answer your question right now, please try again later.😭\n{e}");
+        stdout.write(err.as_bytes())?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    let mut stream = stream.unwrap();
+
+    let color = parse_color(&config.color);
+    stdout.set_color(color_spec.set_fg(Some(color)))?;
     while let Some(Ok(responses)) = stream.next().await {
         for resp in responses {
             stdout.write(resp.response.as_bytes())?;
@@ -51,14 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout.write(b"\n")?;
 
     Ok(())
-}
-
-fn parse_prompt(question: &str, template: &str) -> String {
-    let mut env = Environment::new();
-    env.add_template("prompt_template", template).unwrap();
-    let template = env.get_template("prompt_template").unwrap();
-    let t = template.render(context!(question => question)).unwrap();
-    t
 }
 
 fn parse_config(path: &str) -> Config {
