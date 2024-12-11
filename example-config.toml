@@ -1,4 +1,4 @@
 addr = "http://localhost:11434"
 model = "llama3.1"
 color = "purple"
-prompt_template = "You are a helpful assistant named shark🦈, please answer the question given by user: `{{question}}`."
+functions = ["ddg_searcher", "rust_toolchain_switcher"]
