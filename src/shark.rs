@@ -9,25 +9,8 @@ use ollama_rs::{
     },
     Ollama,
 };
-use serde::Deserialize;
 
 use crate::tools::rust_toolchain_switcher::RustToolchainSwitcher;
-
-const SHARK_FUNCTION_CALLING_PROMPT_TEMPLATE: &'static str = r#"
-You are a helpful assistant, you can decide whether to use functions to answer user's question: {{question}}
-Here are the names and descriptions of the functions you can use:
-{{functionss_description}}
-
-If you decide to use a function, please response in the following format:
-{
-    "function": {name of the function}
-}
-
-If you don't want to use any functions, please response in the follow format:
-{
-    "function": null
-}
-"#;
 
 const SHARK_GENERATATION_PROMPT_TEMPLATE: &'static str = r#"
 You are a helpful assistant called shark🦈, answer the question given by user: {{question}}
@@ -50,9 +33,6 @@ pub struct Shark<'a> {
 impl<'a> Shark<'a> {
     pub fn new(core: Ollama, model: impl ToString, functions: Vec<String>) -> Self {
         let mut template_env = Environment::new();
-        template_env
-            .add_template("function-calling", SHARK_FUNCTION_CALLING_PROMPT_TEMPLATE)
-            .unwrap();
 
         template_env
             .add_template("generation", SHARK_GENERATATION_PROMPT_TEMPLATE)
@@ -75,34 +55,38 @@ impl<'a> Shark<'a> {
         question: impl ToString,
     ) -> Result<GenerationResponseStream, Error> {
         let question = question.to_string();
-        let function = self.request_function(&question).await?;
-        if let Some(func) = function {
-            let function_calling_response = self.call_function(&question, func).await?;
-            let response = function_calling_response.message.unwrap().content;
-            let stream = self.summarize_stream(question, response).await?;
-            Ok(stream)
-        } else {
-            let template = self.template_env.get_template("generation").unwrap();
-            let prompt = template.render(context! {question => question})?;
-            let stream = self
-                .core
-                .generate_stream(GenerationRequest::new(self.model.to_owned(), prompt))
-                .await?;
-            return Ok(stream);
+        match self.call_function(&question).await {
+            Ok(resp) => {
+                let response = resp.message.unwrap().content;
+                let stream = self.summarize_stream(question, response).await?;
+                Ok(stream)
+            }
+            Err(_) => {
+                let template = self.template_env.get_template("generation").unwrap();
+                let prompt = template.render(context! {question => question})?;
+                let stream = self
+                    .core
+                    .generate_stream(GenerationRequest::new(self.model.to_owned(), prompt))
+                    .await?;
+                Ok(stream)
+            }
         }
     }
 
-    async fn call_function(
-        &self,
-        question: impl ToString,
-        func: Arc<dyn Tool>,
-    ) -> Result<ChatMessageResponse, Error> {
+    async fn call_function(&self, question: impl ToString) -> Result<ChatMessageResponse, Error> {
+        let functions: Vec<Arc<dyn Tool>> = self
+            .functions
+            .iter()
+            .map(|(_, func)| func.clone())
+            .collect();
+
+        let user_message = ChatMessage::user(question.to_string());
         let parser = Arc::new(LlamaFunctionCall {});
-        let message = ChatMessage::user(question.to_string());
+
         let response = self
             .core
             .send_function_call(
-                FunctionCallRequest::new(self.model.to_owned(), vec![func], vec![message]),
+                FunctionCallRequest::new(self.model.to_owned(), functions, vec![user_message]),
                 parser,
             )
             .await?;
@@ -123,56 +107,6 @@ impl<'a> Shark<'a> {
             .generate_stream(GenerationRequest::new(self.model.to_owned(), prompt))
             .await?;
         Ok(stream)
-    }
-
-    async fn request_function(
-        &self,
-        question: impl ToString,
-    ) -> Result<Option<Arc<dyn Tool>>, Error> {
-        let question = question.to_string();
-        let functionss_description = self.functions_description();
-        let template = self.template_env.get_template("function-calling")?;
-        let prompt = template.render(
-            context! {question => question, functionss_description => functionss_description},
-        )?;
-
-        let function_resp = self
-            .core
-            .generate(GenerationRequest::new(self.model.to_owned(), prompt))
-            .await?
-            .response;
-
-        let response: FucntionResponse = serde_json::from_str(&function_resp)?;
-        if response.function.is_none() {
-            return Ok(None);
-        }
-
-        let function_name = response
-            .function
-            .unwrap()
-            .trim()
-            .to_lowercase()
-            .replace("'", "");
-
-        if function_name == "null" {
-            return Ok(None);
-        }
-
-        if let Some(f) = self.functions.get(&function_name) {
-            return Ok(Some(f.to_owned()));
-        }
-
-        Ok(None)
-    }
-
-    fn functions_description(&self) -> String {
-        let desc: HashMap<String, String> = self
-            .functions
-            .iter()
-            .map(|(name, tool)| (name.to_owned(), tool.description()))
-            .collect();
-
-        serde_json::to_string(&desc).unwrap()
     }
 
     fn parse_functions(functions: Vec<String>) -> HashMap<String, Arc<dyn Tool>> {
